@@ -231,9 +231,10 @@ def iniciar_broadcast(canal, mensaje, destinatarios, owner):
 #  PARSER DE COMANDOS
 # ─────────────────────────────────────────────────
 PATRON = re.compile(
-    r"^(enviar?|mandar?)\s+(whatsapp|ws|sms|llamada|llamar)\s*(?:a\s+todos?)?\s*[:\-]?\s*(.+)$",
+    r"^(enviar?|mandar?)\s+(?:un\s+)?(whatsapp|ws|sms|llamada|llamar)\s*(?:a\s+todos?)?\s*[:\-]?\s*(.+)$",
     re.IGNORECASE | re.DOTALL
 )
+```
 
 def detectar_broadcast(msg):
     m = PATRON.match(msg.strip())
