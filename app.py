@@ -230,18 +230,27 @@ def iniciar_broadcast(canal, mensaje, destinatarios, owner):
 # ─────────────────────────────────────────────────
 #  PARSER DE COMANDOS
 # ─────────────────────────────────────────────────
-PATRON = re.compile(
-    r"^(enviar?|mandar?)\s+(?:un\s+)?(whatsapp|ws|sms|llamada|llamar)\s*(?:a\s+todos?)?\s*[:\-]?\s*(.+)$",
-    re.IGNORECASE | re.DOTALL
-)
-
 def detectar_broadcast(msg):
-    m = PATRON.match(msg.strip())
-    if not m:
+    txt = msg.strip().lower()
+    # Detectar canal
+    if "sms" in txt:
+        canal = "sms"
+    elif "llamada" in txt or "llamar" in txt:
+        canal = "llamada"
+    elif "whatsapp" in txt or " wa " in txt:
+        canal = "whatsapp"
+    else:
         return None
-    tipo = m.group(2).lower()
-    canal = "llamada" if "llamad" in tipo or "llamar" in tipo else ("sms" if "sms" in tipo else "whatsapp")
-    return canal, m.group(3).strip()
+    # Debe empezar con enviar o mandar
+    if not (txt.startswith("enviar") or txt.startswith("mandar")):
+        return None
+    # Extraer el mensaje después de los dos puntos
+    if ":" not in msg:
+        return None
+    mensaje = msg.split(":", 1)[1].strip()
+    if not mensaje:
+        return None
+    return canal, mensaje
 
 # ─────────────────────────────────────────────────
 #  PROCESADOR PRINCIPAL
