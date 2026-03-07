@@ -216,11 +216,33 @@ def iniciar_broadcast(template, destinatarios, chat_id):
 # ─────────────────────────────────────────────────
 #  PARSER DE COMANDOS
 # ─────────────────────────────────────────────────
+def detectar_envio_cel(msg):
+    """Detecta comando: Enviar WhatsApp cel: 3XXXXXXXXX: mensaje"""
+    txt = msg.strip().lower()
+    if ("whatsapp" not in txt and " wa " not in txt):
+        return None
+    if not (txt.startswith("enviar") or txt.startswith("mandar")):
+        return None
+    if "cel:" not in txt:
+        return None
+    # Formato: Enviar WhatsApp cel: 3118704327: mensaje
+    partes = msg.split(":", 2)
+    if len(partes) < 3:
+        return None
+    cel = re.sub(r'\s', '', partes[1].strip())
+    cel = limpiar_cel(cel) or cel
+    mensaje = partes[2].strip()
+    if not cel or not mensaje:
+        return None
+    return cel, mensaje
+
 def detectar_broadcast(msg):
     txt = msg.strip().lower()
     if "whatsapp" not in txt and " wa " not in txt:
         return None
     if not (txt.startswith("enviar") or txt.startswith("mandar")):
+        return None
+    if "cel:" in txt:
         return None
     if ":" not in msg:
         return None
@@ -253,6 +275,15 @@ def procesar(msg, chat_id):
             return "❌ Envio cancelado."
         else:
             return f"Responde *Si* para confirmar o *No* para cancelar el envio a *{len(p['destinatarios'])}* contactos."
+
+    envio_cel = detectar_envio_cel(msg)
+    if envio_cel:
+        cel, mensaje = envio_cel
+        exito = enviar_whatsapp(cel, mensaje)
+        if exito:
+            return f"✅ Mensaje enviado a *{cel}*\n\nVista previa:\n_{mensaje}_"
+        else:
+            return f"❌ Error enviando a *{cel}*. Verifica que el número esté activo en WhatsApp."
 
     resultado = detectar_broadcast(msg)
     if resultado:
@@ -321,10 +352,6 @@ def setup():
         return jsonify({"error": "PUBLIC_URL no configurada"}), 400
     set_telegram_webhook(public_url)
     return jsonify({"status": "webhook configurado", "url": f"{public_url}/webhook-telegram"}), 200
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
