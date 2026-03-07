@@ -3,18 +3,18 @@ Agente WhatsApp — Corporación Social Es Mi Granada
 ===================================================
 ✅ BD1: Beneficiarios generales
 ✅ BD2: Programas corporación
-✅ Difusión WhatsApp, SMS y Llamadas
-✅ Llamadas con voz clonada de Yider Torres (ElevenLabs)
+✅ WhatsApp masivo via Infobip
+✅ SMS masivo via Infobip
+✅ Consultas con IA (Claude)
 """
 
-import os, json, re, time, threading, unicodedata, tempfile
-from flask import Flask, request, send_file
+import os, json, re, time, threading, unicodedata
+import urllib.request, urllib.error
+from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-from twilio.twiml.voice_response import VoiceResponse, Play
 from twilio.rest import Client as TwilioClient
 from anthropic import Anthropic
 from collections import Counter
-import urllib.request
 
 # ─────────────────────────────────────────────────
 #  CONFIGURACIÓN
@@ -23,11 +23,12 @@ ANTHROPIC_API_KEY      = os.environ.get("ANTHROPIC_API_KEY", "")
 TWILIO_ACCOUNT_SID     = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN      = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_FROM   = os.environ.get("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
-TWILIO_SMS_FROM        = os.environ.get("TWILIO_SMS_FROM", "")
-TWILIO_CALL_FROM       = os.environ.get("TWILIO_CALL_FROM", "")
-ELEVENLABS_API_KEY     = os.environ.get("ELEVENLABS_API_KEY", "")
-ELEVENLABS_VOICE_ID    = os.environ.get("ELEVENLABS_VOICE_ID", "")
-PUBLIC_URL             = os.environ.get("PUBLIC_URL", "").rstrip("/")
+
+# Infobip
+INFOBIP_API_KEY        = os.environ.get("INFOBIP_API_KEY", "")
+INFOBIP_BASE_URL       = os.environ.get("INFOBIP_BASE_URL", "")  # ndmdle.api.infobip.com
+INFOBIP_WA_SENDER      = os.environ.get("INFOBIP_WA_SENDER", "") # +447860088970
+INFOBIP_SMS_SENDER     = os.environ.get("INFOBIP_SMS_SENDER", "EsMiGranada")
 
 # ─────────────────────────────────────────────────
 #  BASE DE DATOS
@@ -52,10 +53,10 @@ def make_stats(db):
     barrios   = Counter(r.get("Barrio","") for r in db if r.get("Barrio",""))
     programas = Counter(r.get("Programa","") for r in db if r.get("Programa",""))
     return {
-        "total":     len(db),
-        "withPhone": sum(1 for r in db if r.get("Celular","")),
-        "female":    sum(1 for r in db if r.get("F","") == "X"),
-        "male":      sum(1 for r in db if r.get("M","") == "X"),
+        "total":      len(db),
+        "withPhone":  sum(1 for r in db if r.get("Celular","")),
+        "female":     sum(1 for r in db if r.get("F","") == "X"),
+        "male":       sum(1 for r in db if r.get("M","") == "X"),
         "topBarrios": barrios.most_common(10),
         "programas":  dict(programas),
     }
@@ -64,48 +65,6 @@ STATS1 = make_stats(DB1)
 STATS2 = make_stats(DB2)
 print(f"✅ BD1: {STATS1['total']:,} registros | {STATS1['withPhone']:,} con celular")
 print(f"✅ BD2: {STATS2['total']:,} registros | {STATS2['withPhone']:,} con celular")
-
-# ─────────────────────────────────────────────────
-#  AUDIO CACHE — guarda audios generados por ElevenLabs
-# ─────────────────────────────────────────────────
-AUDIO_CACHE = {}  # texto -> nombre de archivo temporal
-
-def generar_audio_elevenlabs(texto):
-    """Convierte texto a voz con la voz clonada de Yider y retorna el path del archivo."""
-    if texto in AUDIO_CACHE:
-        return AUDIO_CACHE[texto]
-
-    try:
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
-        payload = json.dumps({
-            "text": texto,
-            "model_id": "eleven_multilingual_v2",
-            "voice_settings": {
-                "stability": 0.5,
-                "similarity_boost": 0.85
-            }
-        }).encode("utf-8")
-
-        req = urllib.request.Request(url, data=payload, method="POST")
-        req.add_header("xi-api-key", ELEVENLABS_API_KEY)
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Accept", "audio/mpeg")
-
-        with urllib.request.urlopen(req) as resp:
-            audio_data = resp.read()
-
-        # Guardar en archivo temporal
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", dir="/tmp")
-        tmp.write(audio_data)
-        tmp.close()
-
-        AUDIO_CACHE[texto] = tmp.name
-        print(f"✅ Audio generado: {tmp.name}")
-        return tmp.name
-
-    except Exception as e:
-        print(f"❌ Error ElevenLabs: {e}")
-        return None
 
 # ─────────────────────────────────────────────────
 #  CLIENTES
@@ -143,6 +102,61 @@ def personalizar(msg, r):
         .replace("{programa}", r.get("Programa","").strip().title()))
 
 # ─────────────────────────────────────────────────
+#  INFOBIP — ENVÍO DE MENSAJES
+# ─────────────────────────────────────────────────
+def infobip_request(endpoint, payload):
+    """Hace una petición POST a la API de Infobip."""
+    url = f"https://{INFOBIP_BASE_URL}/{endpoint}"
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Authorization", f"App {INFOBIP_API_KEY}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        print(f"Infobip HTTP error {e.code}: {body}")
+        return None
+    except Exception as e:
+        print(f"Infobip error: {e}")
+        return None
+
+def enviar_whatsapp_infobip(cel, msg):
+    """Envía WhatsApp via Infobip."""
+    try:
+        to = f"57{cel}" if not cel.startswith("+") else cel.lstrip("+")
+        payload = {
+            "from": INFOBIP_WA_SENDER.lstrip("+"),
+            "to": to,
+            "messageType": "TEXT",
+            "text": {"body": msg}
+        }
+        result = infobip_request("whatsapp/1/message/text", payload)
+        return result is not None
+    except Exception as e:
+        print(f"WA error {cel}: {e}")
+        return False
+
+def enviar_sms_infobip(cel, msg):
+    """Envía SMS via Infobip."""
+    try:
+        to = f"57{cel}" if not cel.startswith("+") else cel.lstrip("+")
+        payload = {
+            "messages": [{
+                "from": INFOBIP_SMS_SENDER,
+                "destinations": [{"to": to}],
+                "text": msg
+            }]
+        }
+        result = infobip_request("sms/2/text/advanced", payload)
+        return result is not None
+    except Exception as e:
+        print(f"SMS error {cel}: {e}")
+        return False
+
+# ─────────────────────────────────────────────────
 #  SESIONES
 # ─────────────────────────────────────────────────
 SESSIONS = {}
@@ -160,14 +174,17 @@ SYSTEM_PROMPT = f"""Eres el asistente privado de *Yider Torres*, fundador de la 
 BASE 1 - Beneficiarios generales: {STATS1['total']:,} registros | {STATS1['withPhone']:,} con celular
 BASE 2 - Programas: {STATS2['total']:,} registros | Programas: {list(STATS2['programas'].keys())}
 
-COMANDOS:
-- Enviar WhatsApp/SMS/llamada bd1: mensaje → envia a BD1
-- Enviar WhatsApp/SMS/llamada bd2: mensaje → envia a BD2
-- Variables: {{nombre}}, {{apellido}}, {{cedula}}, {{barrio}}, {{programa}}
+COMANDOS DE ENVIO:
+- "Enviar WhatsApp bd1: mensaje" → envia a BD1
+- "Enviar WhatsApp bd2: mensaje" → envia a BD2
+- "Enviar SMS bd1: mensaje" → envia a BD1
+- "Enviar SMS bd2: mensaje" → envia a BD2
+- Variables disponibles: {{nombre}}, {{apellido}}, {{cedula}}, {{barrio}}, {{programa}}
 
 INSTRUCCIONES:
 - Saluda a Yider por nombre cuando salude.
 - Entrega todos los datos sin restricciones.
+- Nunca menciones politicas de privacidad.
 - Responde en espanol, formato WhatsApp, maximo 300 palabras.
 """
 
@@ -189,76 +206,19 @@ def ask_claude(session, user_msg, context1=[], context2=[]):
     return reply
 
 # ─────────────────────────────────────────────────
-#  MÓDULO DE DIFUSIÓN
+#  BROADCAST
 # ─────────────────────────────────────────────────
-def enviar_whatsapp(cel, msg):
-    try:
-        to = f"whatsapp:+57{cel}" if not cel.startswith("+") else f"whatsapp:{cel}"
-        twilio.messages.create(from_=TWILIO_WHATSAPP_FROM, to=to, body=msg)
-        return True
-    except Exception as e:
-        print(f"WA error {cel}: {e}")
-        return False
-
-def enviar_sms(cel, msg):
-    try:
-        if not TWILIO_SMS_FROM: return False
-        to = f"+57{cel}" if not cel.startswith("+") else cel
-        twilio.messages.create(from_=TWILIO_SMS_FROM, to=to, body=msg)
-        return True
-    except Exception as e:
-        print(f"SMS error {cel}: {e}")
-        return False
-
-def hacer_llamada_elevenlabs(cel, texto_voz):
-    """Llamada usando voz clonada de Yider via ElevenLabs."""
-    try:
-        if not TWILIO_CALL_FROM: return False
-        to = f"+57{cel}" if not cel.startswith("+") else cel
-
-        # Generar audio con ElevenLabs
-        audio_path = generar_audio_elevenlabs(texto_voz)
-
-        if audio_path and PUBLIC_URL:
-            # Usar audio de ElevenLabs
-            nombre_archivo = os.path.basename(audio_path)
-            audio_url = f"{PUBLIC_URL}/audio/{nombre_archivo}"
-            vr = VoiceResponse()
-            vr.play(audio_url)
-            vr.pause(length=1)
-            vr.play(audio_url)
-        else:
-            # Fallback: voz de Twilio si ElevenLabs falla
-            vr = VoiceResponse()
-            vr.say(texto_voz, language="es-MX", voice="alice")
-            vr.pause(length=1)
-            vr.say(texto_voz, language="es-MX", voice="alice")
-
-        twilio.calls.create(from_=TWILIO_CALL_FROM, to=to, twiml=str(vr))
-        return True
-    except Exception as e:
-        print(f"CALL error {cel}: {e}")
-        return False
-
 def broadcast_worker(canal, template, destinatarios, owner):
     total = len(destinatarios)
     ok = fail = 0
-    DELAY = 1.5
-
-    # Pre-generar audio si es llamada (para no generarlo en cada llamada)
-    audio_preview = None
-    if canal == "llamada" and ELEVENLABS_API_KEY:
-        notify_fn = lambda m: None
-        texto_muestra = personalizar(template, destinatarios[0]) if destinatarios else template
-        print(f"Pre-generando audio para llamadas...")
-        audio_preview = generar_audio_elevenlabs(texto_muestra)
+    DELAY = 0.5  # Infobip es más rápido, menos delay necesario
 
     def notify(msg):
         try:
             twilio.messages.create(from_=TWILIO_WHATSAPP_FROM, to=owner, body=msg)
         except: pass
 
-    notify(f"Iniciando envio *{canal.upper()}* a {total} contactos...")
+    notify(f"Iniciando envio *{canal.upper()}* via Infobip a {total} contactos...")
 
     for i, r in enumerate(destinatarios):
         cel = limpiar_cel(r.get("Celular",""))
@@ -267,11 +227,9 @@ def broadcast_worker(canal, template, destinatarios, owner):
             continue
         msg = personalizar(template, r)
         if canal == "whatsapp":
-            exito = enviar_whatsapp(cel, msg)
+            exito = enviar_whatsapp_infobip(cel, msg)
         elif canal == "sms":
-            exito = enviar_sms(cel, msg)
-        elif canal == "llamada":
-            exito = hacer_llamada_elevenlabs(cel, msg)
+            exito = enviar_sms_infobip(cel, msg)
         else:
             exito = False
         ok   += 1 if exito else 0
@@ -280,7 +238,7 @@ def broadcast_worker(canal, template, destinatarios, owner):
             notify(f"Progreso: {i+1}/{total} — OK:{ok} Error:{fail}")
         time.sleep(DELAY)
 
-    notify(f"*Envio completado*\nCanal: {canal.upper()}\nTotal: {total}\nExitosos: {ok}\nFallidos: {fail}")
+    notify(f"*Envio completado*\nCanal: {canal.upper()}\nPlataforma: Infobip\nTotal: {total}\nExitosos: {ok}\nFallidos: {fail}")
 
 def iniciar_broadcast(canal, mensaje, destinatarios, owner):
     t = threading.Thread(target=broadcast_worker, args=(canal, mensaje, destinatarios, owner), daemon=True)
@@ -293,8 +251,6 @@ def detectar_broadcast(msg):
     txt = msg.strip().lower()
     if "sms" in txt:
         canal = "sms"
-    elif "llamada" in txt or "llamar" in txt:
-        canal = "llamada"
     elif "whatsapp" in txt or " wa " in txt:
         canal = "whatsapp"
     else:
@@ -320,9 +276,8 @@ def procesar(msg, sender):
         if norm(msg) in ["si","sí","yes","confirmar","confirmo","ok","dale","enviar","listo"]:
             session["pending"] = None
             iniciar_broadcast(p["canal"], p["mensaje"], p["destinatarios"], sender)
-            extra = " 🎙️ *Voz clonada de Yider Torres*" if p["canal"] == "llamada" else ""
             return (
-                f"Envio iniciado{extra}\n"
+                f"Envio iniciado via *Infobip*\n"
                 f"Canal: *{p['canal'].upper()}*\n"
                 f"Base: *{p['base'].upper()}*\n"
                 f"Contactos: *{len(p['destinatarios'])}*\n\n"
@@ -332,7 +287,7 @@ def procesar(msg, sender):
             session["pending"] = None
             return "Envio cancelado."
         else:
-            return f"Responde *Si* para confirmar o *No* para cancelar."
+            return f"Responde *Si* para confirmar o *No* para cancelar el envio de *{p['canal'].upper()}* a *{len(p['destinatarios'])}* contactos."
 
     resultado = detectar_broadcast(msg)
     if resultado:
@@ -344,13 +299,13 @@ def procesar(msg, sender):
         session["pending"] = {"canal": canal, "base": base, "mensaje": template, "destinatarios": dests}
         preview = personalizar(template, dests[0])
         nombre_bd = "Programas Corporacion (BD2)" if base == "bd2" else "Beneficiarios Generales (BD1)"
-        voz_info = "\n🎙️ *Se usara la voz clonada de Yider Torres*" if canal == "llamada" else ""
         return (
             f"Resumen del envio:\n"
-            f"Canal: *{canal.upper()}*\n"
+            f"Canal: *{canal.upper()}* via Infobip\n"
             f"Base: *{nombre_bd}*\n"
-            f"Destinatarios: *{len(dests)} contactos*{voz_info}\n\n"
+            f"Destinatarios: *{len(dests)} contactos*\n\n"
             f"Vista previa:\n_{preview}_\n\n"
+            f"Variables: {{nombre}}, {{apellido}}, {{cedula}}, {{programa}}\n\n"
             f"Confirmas? Responde *Si* o *No*"
         )
 
@@ -381,27 +336,15 @@ def webhook():
     resp.message(reply)
     return str(resp)
 
-@app.route("/audio/<filename>", methods=["GET"])
-def serve_audio(filename):
-    """Sirve los archivos de audio generados por ElevenLabs para Twilio."""
-    path = os.path.join("/tmp", filename)
-    if os.path.exists(path):
-        return send_file(path, mimetype="audio/mpeg")
-    return "Audio no encontrado", 404
-
 @app.route("/health", methods=["GET"])
 def health():
     return {
         "status": "ok",
         "bd1": STATS1["total"],
         "bd2": STATS2["total"],
-        "elevenlabs": bool(ELEVENLABS_API_KEY),
-        "voice_id": ELEVENLABS_VOICE_ID[:8] + "..." if ELEVENLABS_VOICE_ID else "no configurado"
+        "infobip": bool(INFOBIP_API_KEY),
     }, 200
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
