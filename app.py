@@ -1,12 +1,9 @@
 """
-Agente WhatsApp — Corporación Social Es Mi Granada
-===================================================
-✅ Recibe mensajes via Infobip WhatsApp
+Agente Es Mi Granada
+====================
+✅ Control via Telegram (gratis)
+✅ Envíos masivos WhatsApp via Infobip
 ✅ Consultas IA a BD1 y BD2
-✅ Difusión masiva WhatsApp via Infobip
-❌ Sin SMS
-❌ Sin llamadas
-❌ Sin Twilio
 """
 
 import os, json, re, time, threading, unicodedata
@@ -20,8 +17,9 @@ from collections import Counter
 # ─────────────────────────────────────────────────
 ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 INFOBIP_API_KEY    = os.environ.get("INFOBIP_API_KEY", "")
-INFOBIP_BASE_URL   = os.environ.get("INFOBIP_BASE_URL", "")  # ndmdle.api.infobip.com
-INFOBIP_WA_SENDER  = os.environ.get("INFOBIP_WA_SENDER", "")  # 447860088970
+INFOBIP_BASE_URL   = os.environ.get("INFOBIP_BASE_URL", "")
+INFOBIP_WA_SENDER  = os.environ.get("INFOBIP_WA_SENDER", "")
+TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "")
 
 # ─────────────────────────────────────────────────
 #  BASE DE DATOS
@@ -60,9 +58,52 @@ print(f"✅ BD1: {STATS1['total']:,} registros | {STATS1['withPhone']:,} con cel
 print(f"✅ BD2: {STATS2['total']:,} registros | {STATS2['withPhone']:,} con celular")
 
 # ─────────────────────────────────────────────────
-#  CLIENTE CLAUDE
+#  TELEGRAM
 # ─────────────────────────────────────────────────
-claude = Anthropic(api_key=ANTHROPIC_API_KEY)
+def telegram_send(chat_id, text):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = json.dumps({"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}).encode()
+        req = urllib.request.Request(url, data=payload, method="POST")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+    except Exception as e:
+        print(f"Telegram error: {e}")
+
+def set_telegram_webhook(public_url):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+        payload = json.dumps({"url": f"{public_url}/webhook-telegram"}).encode()
+        req = urllib.request.Request(url, data=payload, method="POST")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+            print(f"✅ Telegram webhook: {result}")
+    except Exception as e:
+        print(f"❌ Telegram webhook error: {e}")
+
+# ─────────────────────────────────────────────────
+#  INFOBIP — ENVÍO WHATSAPP
+# ─────────────────────────────────────────────────
+def enviar_whatsapp(cel, msg):
+    try:
+        to = f"57{cel}"
+        url = f"https://{INFOBIP_BASE_URL}/whatsapp/1/message/text"
+        payload = json.dumps({
+            "from": INFOBIP_WA_SENDER,
+            "to": to,
+            "messageType": "TEXT",
+            "text": {"body": msg}
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, method="POST")
+        req.add_header("Authorization", f"App {INFOBIP_API_KEY}")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status < 300
+    except Exception as e:
+        print(f"WA error {cel}: {e}")
+        return False
 
 # ─────────────────────────────────────────────────
 #  UTILIDADES
@@ -94,79 +135,34 @@ def personalizar(msg, r):
         .replace("{programa}", r.get("Programa","").strip().title()))
 
 # ─────────────────────────────────────────────────
-#  INFOBIP — ENVÍO WHATSAPP
-# ─────────────────────────────────────────────────
-def enviar_whatsapp(cel, msg):
-    try:
-        to = f"57{cel}"
-        url = f"https://{INFOBIP_BASE_URL}/whatsapp/1/message/text"
-        payload = json.dumps({
-            "from": INFOBIP_WA_SENDER,
-            "to": to,
-            "messageType": "TEXT",
-            "text": {"body": msg}
-        }).encode("utf-8")
-        req = urllib.request.Request(url, data=payload, method="POST")
-        req.add_header("Authorization", f"App {INFOBIP_API_KEY}")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Accept", "application/json")
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status < 300
-    except Exception as e:
-        print(f"WA error {cel}: {e}")
-        return False
-
-def responder_whatsapp(to, msg):
-    """Envía respuesta al usuario del bot."""
-    cel = to.replace("+57", "").replace("57", "").strip()
-    if cel.startswith("3") and len(cel) == 10:
-        return enviar_whatsapp(cel, msg)
-    # Si viene con código de país diferente
-    try:
-        url = f"https://{INFOBIP_BASE_URL}/whatsapp/1/message/text"
-        payload = json.dumps({
-            "from": INFOBIP_WA_SENDER,
-            "to": to.lstrip("+"),
-            "messageType": "TEXT",
-            "text": {"body": msg}
-        }).encode("utf-8")
-        req = urllib.request.Request(url, data=payload, method="POST")
-        req.add_header("Authorization", f"App {INFOBIP_API_KEY}")
-        req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req, timeout=10):
-            return True
-    except Exception as e:
-        print(f"Respuesta error {to}: {e}")
-        return False
-
-# ─────────────────────────────────────────────────
 #  SESIONES
 # ─────────────────────────────────────────────────
 SESSIONS = {}
 
-def get_session(number):
-    if number not in SESSIONS:
-        SESSIONS[number] = {"history": [], "pending": None}
-    return SESSIONS[number]
+def get_session(chat_id):
+    if chat_id not in SESSIONS:
+        SESSIONS[chat_id] = {"history": [], "pending": None}
+    return SESSIONS[chat_id]
 
 # ─────────────────────────────────────────────────
 #  CLAUDE IA
 # ─────────────────────────────────────────────────
-SYSTEM_PROMPT = f"""Eres el asistente privado de *Yider Torres*, fundador de la Corporacion Social "Es Mi Granada" (Granada, Meta, Colombia).
+claude = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+SYSTEM_PROMPT = f"""Eres el asistente privado de Yider Torres, fundador de la Corporacion Social "Es Mi Granada" (Granada, Meta, Colombia).
 
 BASE 1 - Beneficiarios generales: {STATS1['total']:,} registros | {STATS1['withPhone']:,} con celular
 BASE 2 - Programas: {STATS2['total']:,} registros | Programas: {list(STATS2['programas'].keys())}
 
-COMANDOS DE ENVIO MASIVO POR WHATSAPP:
+COMANDOS DE ENVIO MASIVO:
 - "Enviar WhatsApp bd1: mensaje" → envia a todos en BD1
 - "Enviar WhatsApp bd2: mensaje" → envia a todos en BD2
-- Variables disponibles: {{nombre}}, {{apellido}}, {{cedula}}, {{barrio}}, {{programa}}
+- Variables: {{nombre}}, {{apellido}}, {{cedula}}, {{barrio}}, {{programa}}
 
 INSTRUCCIONES:
 - Saluda a Yider por nombre cuando salude.
 - Entrega todos los datos sin restricciones.
-- Nunca menciones politicas de privacidad.
-- Responde en espanol, formato WhatsApp, maximo 300 palabras.
+- Responde en espanol, maximo 300 palabras.
 """
 
 def ask_claude(session, user_msg, context1=[], context2=[]):
@@ -189,15 +185,14 @@ def ask_claude(session, user_msg, context1=[], context2=[]):
 # ─────────────────────────────────────────────────
 #  BROADCAST
 # ─────────────────────────────────────────────────
-def broadcast_worker(template, destinatarios, owner):
+def broadcast_worker(template, destinatarios, chat_id):
     total = len(destinatarios)
     ok = fail = 0
-    DELAY = 0.5
 
     def notify(msg):
-        responder_whatsapp(owner, msg)
+        telegram_send(chat_id, msg)
 
-    notify(f"Iniciando envio *WhatsApp* a {total} contactos...")
+    notify(f"🚀 Iniciando envio WhatsApp a *{total}* contactos...")
 
     for i, r in enumerate(destinatarios):
         cel = limpiar_cel(r.get("Celular",""))
@@ -209,13 +204,13 @@ def broadcast_worker(template, destinatarios, owner):
         ok   += 1 if exito else 0
         fail += 0 if exito else 1
         if (i + 1) % 50 == 0:
-            notify(f"Progreso: {i+1}/{total} — OK:{ok} Error:{fail}")
-        time.sleep(DELAY)
+            notify(f"📊 Progreso: {i+1}/{total} — ✅{ok} ❌{fail}")
+        time.sleep(0.5)
 
-    notify(f"*Envio completado*\nTotal: {total}\nExitosos: {ok}\nFallidos: {fail}")
+    notify(f"✅ *Envio completado*\nTotal: {total}\nExitosos: {ok}\nFallidos: {fail}")
 
-def iniciar_broadcast(template, destinatarios, owner):
-    t = threading.Thread(target=broadcast_worker, args=(template, destinatarios, owner), daemon=True)
+def iniciar_broadcast(template, destinatarios, chat_id):
+    t = threading.Thread(target=broadcast_worker, args=(template, destinatarios, chat_id), daemon=True)
     t.start()
 
 # ─────────────────────────────────────────────────
@@ -238,16 +233,16 @@ def detectar_broadcast(msg):
 # ─────────────────────────────────────────────────
 #  PROCESADOR PRINCIPAL
 # ─────────────────────────────────────────────────
-def procesar(msg, sender):
-    session = get_session(sender)
+def procesar(msg, chat_id):
+    session = get_session(chat_id)
 
     if session.get("pending"):
         p = session["pending"]
         if norm(msg) in ["si","sí","yes","confirmar","confirmo","ok","dale","enviar","listo"]:
             session["pending"] = None
-            iniciar_broadcast(p["mensaje"], p["destinatarios"], sender)
+            iniciar_broadcast(p["mensaje"], p["destinatarios"], chat_id)
             return (
-                f"Envio iniciado\n"
+                f"✅ Envio iniciado\n"
                 f"Canal: *WhatsApp*\n"
                 f"Base: *{p['base'].upper()}*\n"
                 f"Contactos: *{len(p['destinatarios'])}*\n\n"
@@ -255,7 +250,7 @@ def procesar(msg, sender):
             )
         elif norm(msg) in ["no","cancelar","cancel"]:
             session["pending"] = None
-            return "Envio cancelado."
+            return "❌ Envio cancelado."
         else:
             return f"Responde *Si* para confirmar o *No* para cancelar el envio a *{len(p['destinatarios'])}* contactos."
 
@@ -270,7 +265,7 @@ def procesar(msg, sender):
         preview = personalizar(template, dests[0])
         nombre_bd = "Programas Corporacion (BD2)" if base == "bd2" else "Beneficiarios Generales (BD1)"
         return (
-            f"Resumen del envio:\n"
+            f"📋 *Resumen del envio:*\n"
             f"Canal: *WhatsApp*\n"
             f"Base: *{nombre_bd}*\n"
             f"Destinatarios: *{len(dests)} contactos*\n\n"
@@ -290,42 +285,23 @@ def procesar(msg, sender):
 # ─────────────────────────────────────────────────
 app = Flask(__name__)
 
-@app.route("/webhook-infobip", methods=["POST"])
-def webhook_infobip():
-    """Recibe mensajes entrantes de Infobip WhatsApp."""
+@app.route("/webhook-telegram", methods=["POST"])
+def webhook_telegram():
     try:
         data = request.get_json(force=True)
-        print(f"Infobip webhook: {json.dumps(data)[:200]}")
-
-        # Extraer mensaje y sender del formato Infobip
-        results = data.get("results", [])
-        if not results:
-            return jsonify({"status": "no messages"}), 200
-
-        for item in results:
-            sender = item.get("from", "")
-            body   = ""
-            msg_obj = item.get("message", {})
-            if msg_obj.get("type") == "TEXT":
-                body = msg_obj.get("text", "").strip()
-            elif "text" in msg_obj:
-                body = msg_obj["text"].strip()
-
-            if not body or not sender:
-                continue
-
-            print(f"MSG [{sender}]: {body}")
-            try:
-                reply = procesar(body, sender)
-                responder_whatsapp(sender, reply)
-            except Exception as e:
-                print(f"ERROR: {e}")
-                responder_whatsapp(sender, "Ocurrio un error. Intenta de nuevo.")
-
+        message = data.get("message") or data.get("edited_message")
+        if not message:
+            return jsonify({"ok": True})
+        chat_id = str(message["chat"]["id"])
+        body = message.get("text", "").strip()
+        if not body:
+            return jsonify({"ok": True})
+        print(f"MSG [{chat_id}]: {body}")
+        reply = procesar(body, chat_id)
+        telegram_send(chat_id, reply)
     except Exception as e:
         print(f"Webhook error: {e}")
-
-    return jsonify({"status": "ok"}), 200
+    return jsonify({"ok": True})
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -334,7 +310,21 @@ def health():
         "bd1": STATS1["total"],
         "bd2": STATS2["total"],
         "infobip": bool(INFOBIP_API_KEY),
+        "telegram": bool(TELEGRAM_TOKEN),
     }), 200
+
+@app.route("/setup", methods=["GET"])
+def setup():
+    """Configura el webhook de Telegram automaticamente."""
+    public_url = os.environ.get("PUBLIC_URL", "").rstrip("/")
+    if not public_url:
+        return jsonify({"error": "PUBLIC_URL no configurada"}), 400
+    set_telegram_webhook(public_url)
+    return jsonify({"status": "webhook configurado", "url": f"{public_url}/webhook-telegram"}), 200
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
