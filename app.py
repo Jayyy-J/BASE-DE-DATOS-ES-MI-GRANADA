@@ -1,34 +1,27 @@
 """
 Agente WhatsApp — Corporación Social Es Mi Granada
 ===================================================
-✅ BD1: Beneficiarios generales
-✅ BD2: Programas corporación
-✅ WhatsApp masivo via Infobip
-✅ SMS masivo via Infobip
-✅ Consultas con IA (Claude)
+✅ Recibe mensajes via Infobip WhatsApp
+✅ Consultas IA a BD1 y BD2
+✅ Difusión masiva WhatsApp via Infobip
+❌ Sin SMS
+❌ Sin llamadas
+❌ Sin Twilio
 """
 
 import os, json, re, time, threading, unicodedata
 import urllib.request, urllib.error
-from flask import Flask, request
-from twilio.twiml.messaging_response import MessagingResponse
-from twilio.rest import Client as TwilioClient
+from flask import Flask, request, jsonify
 from anthropic import Anthropic
 from collections import Counter
 
 # ─────────────────────────────────────────────────
 #  CONFIGURACIÓN
 # ─────────────────────────────────────────────────
-ANTHROPIC_API_KEY      = os.environ.get("ANTHROPIC_API_KEY", "")
-TWILIO_ACCOUNT_SID     = os.environ.get("TWILIO_ACCOUNT_SID", "")
-TWILIO_AUTH_TOKEN      = os.environ.get("TWILIO_AUTH_TOKEN", "")
-TWILIO_WHATSAPP_FROM   = os.environ.get("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
-
-# Infobip
-INFOBIP_API_KEY        = os.environ.get("INFOBIP_API_KEY", "")
-INFOBIP_BASE_URL       = os.environ.get("INFOBIP_BASE_URL", "")  # ndmdle.api.infobip.com
-INFOBIP_WA_SENDER      = os.environ.get("INFOBIP_WA_SENDER", "") # +447860088970
-INFOBIP_SMS_SENDER     = os.environ.get("INFOBIP_SMS_SENDER", "EsMiGranada")
+ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+INFOBIP_API_KEY    = os.environ.get("INFOBIP_API_KEY", "")
+INFOBIP_BASE_URL   = os.environ.get("INFOBIP_BASE_URL", "")  # ndmdle.api.infobip.com
+INFOBIP_WA_SENDER  = os.environ.get("INFOBIP_WA_SENDER", "")  # 447860088970
 
 # ─────────────────────────────────────────────────
 #  BASE DE DATOS
@@ -67,10 +60,9 @@ print(f"✅ BD1: {STATS1['total']:,} registros | {STATS1['withPhone']:,} con cel
 print(f"✅ BD2: {STATS2['total']:,} registros | {STATS2['withPhone']:,} con celular")
 
 # ─────────────────────────────────────────────────
-#  CLIENTES
+#  CLIENTE CLAUDE
 # ─────────────────────────────────────────────────
 claude = Anthropic(api_key=ANTHROPIC_API_KEY)
-twilio = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # ─────────────────────────────────────────────────
 #  UTILIDADES
@@ -102,58 +94,49 @@ def personalizar(msg, r):
         .replace("{programa}", r.get("Programa","").strip().title()))
 
 # ─────────────────────────────────────────────────
-#  INFOBIP — ENVÍO DE MENSAJES
+#  INFOBIP — ENVÍO WHATSAPP
 # ─────────────────────────────────────────────────
-def infobip_request(endpoint, payload):
-    """Hace una petición POST a la API de Infobip."""
-    url = f"https://{INFOBIP_BASE_URL}/{endpoint}"
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Authorization", f"App {INFOBIP_API_KEY}")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Accept", "application/json")
+def enviar_whatsapp(cel, msg):
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()
-        print(f"Infobip HTTP error {e.code}: {body}")
-        return None
-    except Exception as e:
-        print(f"Infobip error: {e}")
-        return None
-
-def enviar_whatsapp_infobip(cel, msg):
-    """Envía WhatsApp via Infobip."""
-    try:
-        to = f"57{cel}" if not cel.startswith("+") else cel.lstrip("+")
-        payload = {
-            "from": INFOBIP_WA_SENDER.lstrip("+"),
+        to = f"57{cel}"
+        url = f"https://{INFOBIP_BASE_URL}/whatsapp/1/message/text"
+        payload = json.dumps({
+            "from": INFOBIP_WA_SENDER,
             "to": to,
             "messageType": "TEXT",
             "text": {"body": msg}
-        }
-        result = infobip_request("whatsapp/1/message/text", payload)
-        return result is not None
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, method="POST")
+        req.add_header("Authorization", f"App {INFOBIP_API_KEY}")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Accept", "application/json")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status < 300
     except Exception as e:
         print(f"WA error {cel}: {e}")
         return False
 
-def enviar_sms_infobip(cel, msg):
-    """Envía SMS via Infobip."""
+def responder_whatsapp(to, msg):
+    """Envía respuesta al usuario del bot."""
+    cel = to.replace("+57", "").replace("57", "").strip()
+    if cel.startswith("3") and len(cel) == 10:
+        return enviar_whatsapp(cel, msg)
+    # Si viene con código de país diferente
     try:
-        to = f"57{cel}" if not cel.startswith("+") else cel.lstrip("+")
-        payload = {
-            "messages": [{
-                "from": INFOBIP_SMS_SENDER,
-                "destinations": [{"to": to}],
-                "text": msg
-            }]
-        }
-        result = infobip_request("sms/2/text/advanced", payload)
-        return result is not None
+        url = f"https://{INFOBIP_BASE_URL}/whatsapp/1/message/text"
+        payload = json.dumps({
+            "from": INFOBIP_WA_SENDER,
+            "to": to.lstrip("+"),
+            "messageType": "TEXT",
+            "text": {"body": msg}
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, method="POST")
+        req.add_header("Authorization", f"App {INFOBIP_API_KEY}")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=10):
+            return True
     except Exception as e:
-        print(f"SMS error {cel}: {e}")
+        print(f"Respuesta error {to}: {e}")
         return False
 
 # ─────────────────────────────────────────────────
@@ -174,11 +157,9 @@ SYSTEM_PROMPT = f"""Eres el asistente privado de *Yider Torres*, fundador de la 
 BASE 1 - Beneficiarios generales: {STATS1['total']:,} registros | {STATS1['withPhone']:,} con celular
 BASE 2 - Programas: {STATS2['total']:,} registros | Programas: {list(STATS2['programas'].keys())}
 
-COMANDOS DE ENVIO:
-- "Enviar WhatsApp bd1: mensaje" → envia a BD1
-- "Enviar WhatsApp bd2: mensaje" → envia a BD2
-- "Enviar SMS bd1: mensaje" → envia a BD1
-- "Enviar SMS bd2: mensaje" → envia a BD2
+COMANDOS DE ENVIO MASIVO POR WHATSAPP:
+- "Enviar WhatsApp bd1: mensaje" → envia a todos en BD1
+- "Enviar WhatsApp bd2: mensaje" → envia a todos en BD2
 - Variables disponibles: {{nombre}}, {{apellido}}, {{cedula}}, {{barrio}}, {{programa}}
 
 INSTRUCCIONES:
@@ -208,17 +189,15 @@ def ask_claude(session, user_msg, context1=[], context2=[]):
 # ─────────────────────────────────────────────────
 #  BROADCAST
 # ─────────────────────────────────────────────────
-def broadcast_worker(canal, template, destinatarios, owner):
+def broadcast_worker(template, destinatarios, owner):
     total = len(destinatarios)
     ok = fail = 0
-    DELAY = 0.5  # Infobip es más rápido, menos delay necesario
+    DELAY = 0.5
 
     def notify(msg):
-        try:
-            twilio.messages.create(from_=TWILIO_WHATSAPP_FROM, to=owner, body=msg)
-        except: pass
+        responder_whatsapp(owner, msg)
 
-    notify(f"Iniciando envio *{canal.upper()}* via Infobip a {total} contactos...")
+    notify(f"Iniciando envio *WhatsApp* a {total} contactos...")
 
     for i, r in enumerate(destinatarios):
         cel = limpiar_cel(r.get("Celular",""))
@@ -226,22 +205,17 @@ def broadcast_worker(canal, template, destinatarios, owner):
             fail += 1
             continue
         msg = personalizar(template, r)
-        if canal == "whatsapp":
-            exito = enviar_whatsapp_infobip(cel, msg)
-        elif canal == "sms":
-            exito = enviar_sms_infobip(cel, msg)
-        else:
-            exito = False
+        exito = enviar_whatsapp(cel, msg)
         ok   += 1 if exito else 0
         fail += 0 if exito else 1
         if (i + 1) % 50 == 0:
             notify(f"Progreso: {i+1}/{total} — OK:{ok} Error:{fail}")
         time.sleep(DELAY)
 
-    notify(f"*Envio completado*\nCanal: {canal.upper()}\nPlataforma: Infobip\nTotal: {total}\nExitosos: {ok}\nFallidos: {fail}")
+    notify(f"*Envio completado*\nTotal: {total}\nExitosos: {ok}\nFallidos: {fail}")
 
-def iniciar_broadcast(canal, mensaje, destinatarios, owner):
-    t = threading.Thread(target=broadcast_worker, args=(canal, mensaje, destinatarios, owner), daemon=True)
+def iniciar_broadcast(template, destinatarios, owner):
+    t = threading.Thread(target=broadcast_worker, args=(template, destinatarios, owner), daemon=True)
     t.start()
 
 # ─────────────────────────────────────────────────
@@ -249,11 +223,7 @@ def iniciar_broadcast(canal, mensaje, destinatarios, owner):
 # ─────────────────────────────────────────────────
 def detectar_broadcast(msg):
     txt = msg.strip().lower()
-    if "sms" in txt:
-        canal = "sms"
-    elif "whatsapp" in txt or " wa " in txt:
-        canal = "whatsapp"
-    else:
+    if "whatsapp" not in txt and " wa " not in txt:
         return None
     if not (txt.startswith("enviar") or txt.startswith("mandar")):
         return None
@@ -263,7 +233,7 @@ def detectar_broadcast(msg):
     mensaje = msg.split(":", 1)[1].strip()
     if not mensaje:
         return None
-    return canal, base, mensaje
+    return base, mensaje
 
 # ─────────────────────────────────────────────────
 #  PROCESADOR PRINCIPAL
@@ -275,10 +245,10 @@ def procesar(msg, sender):
         p = session["pending"]
         if norm(msg) in ["si","sí","yes","confirmar","confirmo","ok","dale","enviar","listo"]:
             session["pending"] = None
-            iniciar_broadcast(p["canal"], p["mensaje"], p["destinatarios"], sender)
+            iniciar_broadcast(p["mensaje"], p["destinatarios"], sender)
             return (
-                f"Envio iniciado via *Infobip*\n"
-                f"Canal: *{p['canal'].upper()}*\n"
+                f"Envio iniciado\n"
+                f"Canal: *WhatsApp*\n"
                 f"Base: *{p['base'].upper()}*\n"
                 f"Contactos: *{len(p['destinatarios'])}*\n\n"
                 f"Te reportare el progreso cada 50 envios."
@@ -287,21 +257,21 @@ def procesar(msg, sender):
             session["pending"] = None
             return "Envio cancelado."
         else:
-            return f"Responde *Si* para confirmar o *No* para cancelar el envio de *{p['canal'].upper()}* a *{len(p['destinatarios'])}* contactos."
+            return f"Responde *Si* para confirmar o *No* para cancelar el envio a *{len(p['destinatarios'])}* contactos."
 
     resultado = detectar_broadcast(msg)
     if resultado:
-        canal, base, template = resultado
+        base, template = resultado
         db_target = DB2 if base == "bd2" else DB1
         dests = [r for r in db_target if r.get("Celular","").strip()]
         if not dests:
             return f"No hay contactos con celular en {base.upper()}."
-        session["pending"] = {"canal": canal, "base": base, "mensaje": template, "destinatarios": dests}
+        session["pending"] = {"base": base, "mensaje": template, "destinatarios": dests}
         preview = personalizar(template, dests[0])
         nombre_bd = "Programas Corporacion (BD2)" if base == "bd2" else "Beneficiarios Generales (BD1)"
         return (
             f"Resumen del envio:\n"
-            f"Canal: *{canal.upper()}* via Infobip\n"
+            f"Canal: *WhatsApp*\n"
             f"Base: *{nombre_bd}*\n"
             f"Destinatarios: *{len(dests)} contactos*\n\n"
             f"Vista previa:\n_{preview}_\n\n"
@@ -320,30 +290,51 @@ def procesar(msg, sender):
 # ─────────────────────────────────────────────────
 app = Flask(__name__)
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    body   = request.form.get("Body", "").strip()
-    sender = request.form.get("From", "unknown")
-    print(f"MSG [{sender}]: {body}")
-    if not body:
-        return str(MessagingResponse())
+@app.route("/webhook-infobip", methods=["POST"])
+def webhook_infobip():
+    """Recibe mensajes entrantes de Infobip WhatsApp."""
     try:
-        reply = procesar(body, sender)
+        data = request.get_json(force=True)
+        print(f"Infobip webhook: {json.dumps(data)[:200]}")
+
+        # Extraer mensaje y sender del formato Infobip
+        results = data.get("results", [])
+        if not results:
+            return jsonify({"status": "no messages"}), 200
+
+        for item in results:
+            sender = item.get("from", "")
+            body   = ""
+            msg_obj = item.get("message", {})
+            if msg_obj.get("type") == "TEXT":
+                body = msg_obj.get("text", "").strip()
+            elif "text" in msg_obj:
+                body = msg_obj["text"].strip()
+
+            if not body or not sender:
+                continue
+
+            print(f"MSG [{sender}]: {body}")
+            try:
+                reply = procesar(body, sender)
+                responder_whatsapp(sender, reply)
+            except Exception as e:
+                print(f"ERROR: {e}")
+                responder_whatsapp(sender, "Ocurrio un error. Intenta de nuevo.")
+
     except Exception as e:
-        print(f"ERROR: {e}")
-        reply = "Ocurrio un error. Intenta de nuevo."
-    resp = MessagingResponse()
-    resp.message(reply)
-    return str(resp)
+        print(f"Webhook error: {e}")
+
+    return jsonify({"status": "ok"}), 200
 
 @app.route("/health", methods=["GET"])
 def health():
-    return {
+    return jsonify({
         "status": "ok",
         "bd1": STATS1["total"],
         "bd2": STATS2["total"],
         "infobip": bool(INFOBIP_API_KEY),
-    }, 200
+    }), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
