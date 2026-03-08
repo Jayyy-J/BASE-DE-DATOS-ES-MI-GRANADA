@@ -105,6 +105,26 @@ def enviar_whatsapp(cel, msg):
         print(f"WA error {cel}: {e}")
         return False
 
+def enviar_sms(cel, msg):
+    try:
+        to = f"57{cel}"
+        url = f"https://{INFOBIP_BASE_URL}/sms/2/text/advanced"
+        payload = json.dumps({
+            "messages": [{
+                "from": os.environ.get("INFOBIP_SMS_SENDER", "EsMiGranada"),
+                "destinations": [{"to": to}],
+                "text": msg
+            }]
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, method="POST")
+        req.add_header("Authorization", f"App {INFOBIP_API_KEY}")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status < 300
+    except Exception as e:
+        print(f"SMS error {cel}: {e}")
+        return False
+
 # ─────────────────────────────────────────────────
 #  UTILIDADES
 # ─────────────────────────────────────────────────
@@ -155,8 +175,10 @@ BASE 1 - Beneficiarios generales: {STATS1['total']:,} registros | {STATS1['withP
 BASE 2 - Programas: {STATS2['total']:,} registros | Programas: {list(STATS2['programas'].keys())}
 
 COMANDOS DE ENVIO MASIVO:
-- "Enviar WhatsApp bd1: mensaje" → envia a todos en BD1
-- "Enviar WhatsApp bd2: mensaje" → envia a todos en BD2
+- "Enviar WhatsApp bd1: mensaje" → envia WhatsApp a todos en BD1
+- "Enviar WhatsApp bd2: mensaje" → envia WhatsApp a todos en BD2
+- "Enviar SMS bd1: mensaje" → envia SMS a todos en BD1
+- "Enviar SMS bd2: mensaje" → envia SMS a todos en BD2
 - Variables: {{nombre}}, {{apellido}}, {{cedula}}, {{barrio}}, {{programa}}
 
 INSTRUCCIONES:
@@ -185,14 +207,14 @@ def ask_claude(session, user_msg, context1=[], context2=[]):
 # ─────────────────────────────────────────────────
 #  BROADCAST
 # ─────────────────────────────────────────────────
-def broadcast_worker(template, destinatarios, chat_id):
+def broadcast_worker(canal, template, destinatarios, chat_id):
     total = len(destinatarios)
     ok = fail = 0
 
     def notify(msg):
         telegram_send(chat_id, msg)
 
-    notify(f"🚀 Iniciando envio WhatsApp a *{total}* contactos...")
+    notify(f"🚀 Iniciando envio *{canal.upper()}* a *{total}* contactos...")
 
     for i, r in enumerate(destinatarios):
         cel = limpiar_cel(r.get("Celular",""))
@@ -200,17 +222,20 @@ def broadcast_worker(template, destinatarios, chat_id):
             fail += 1
             continue
         msg = personalizar(template, r)
-        exito = enviar_whatsapp(cel, msg)
+        if canal == "sms":
+            exito = enviar_sms(cel, msg)
+        else:
+            exito = enviar_whatsapp(cel, msg)
         ok   += 1 if exito else 0
         fail += 0 if exito else 1
         if (i + 1) % 50 == 0:
             notify(f"📊 Progreso: {i+1}/{total} — ✅{ok} ❌{fail}")
         time.sleep(0.5)
 
-    notify(f"✅ *Envio completado*\nTotal: {total}\nExitosos: {ok}\nFallidos: {fail}")
+    notify(f"✅ *Envio completado*\nCanal: {canal.upper()}\nTotal: {total}\nExitosos: {ok}\nFallidos: {fail}")
 
-def iniciar_broadcast(template, destinatarios, chat_id):
-    t = threading.Thread(target=broadcast_worker, args=(template, destinatarios, chat_id), daemon=True)
+def iniciar_broadcast(canal, template, destinatarios, chat_id):
+    t = threading.Thread(target=broadcast_worker, args=(canal, template, destinatarios, chat_id), daemon=True)
     t.start()
 
 # ─────────────────────────────────────────────────
@@ -238,7 +263,9 @@ def detectar_envio_cel(msg):
 
 def detectar_broadcast(msg):
     txt = msg.strip().lower()
-    if "whatsapp" not in txt and " wa " not in txt:
+    tiene_wa = "whatsapp" in txt or " wa " in txt
+    tiene_sms = "sms" in txt
+    if not tiene_wa and not tiene_sms:
         return None
     if not (txt.startswith("enviar") or txt.startswith("mandar")):
         return None
@@ -246,11 +273,12 @@ def detectar_broadcast(msg):
         return None
     if ":" not in msg:
         return None
+    canal = "sms" if tiene_sms else "whatsapp"
     base = "bd2" if "bd2" in txt else "bd1"
     mensaje = msg.split(":", 1)[1].strip()
     if not mensaje:
         return None
-    return base, mensaje
+    return canal, base, mensaje
 
 # ─────────────────────────────────────────────────
 #  PROCESADOR PRINCIPAL
@@ -262,10 +290,10 @@ def procesar(msg, chat_id):
         p = session["pending"]
         if norm(msg) in ["si","sí","yes","confirmar","confirmo","ok","dale","enviar","listo"]:
             session["pending"] = None
-            iniciar_broadcast(p["mensaje"], p["destinatarios"], chat_id)
+            iniciar_broadcast(p["canal"], p["mensaje"], p["destinatarios"], chat_id)
             return (
                 f"✅ Envio iniciado\n"
-                f"Canal: *WhatsApp*\n"
+                f"Canal: *{p['canal'].upper()}*\n"
                 f"Base: *{p['base'].upper()}*\n"
                 f"Contactos: *{len(p['destinatarios'])}*\n\n"
                 f"Te reportare el progreso cada 50 envios."
@@ -287,17 +315,17 @@ def procesar(msg, chat_id):
 
     resultado = detectar_broadcast(msg)
     if resultado:
-        base, template = resultado
+        canal, base, template = resultado
         db_target = DB2 if base == "bd2" else DB1
         dests = [r for r in db_target if r.get("Celular","").strip()]
         if not dests:
             return f"No hay contactos con celular en {base.upper()}."
-        session["pending"] = {"base": base, "mensaje": template, "destinatarios": dests}
+        session["pending"] = {"canal": canal, "base": base, "mensaje": template, "destinatarios": dests}
         preview = personalizar(template, dests[0])
         nombre_bd = "Programas Corporacion (BD2)" if base == "bd2" else "Beneficiarios Generales (BD1)"
         return (
             f"📋 *Resumen del envio:*\n"
-            f"Canal: *WhatsApp*\n"
+            f"Canal: *{canal.upper()}*\n"
             f"Base: *{nombre_bd}*\n"
             f"Destinatarios: *{len(dests)} contactos*\n\n"
             f"Vista previa:\n_{preview}_\n\n"
